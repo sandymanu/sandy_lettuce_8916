@@ -278,7 +278,7 @@ struct mipi_panel_info {
 	/* The packet-size should not bet changed */
 	char no_max_pkt_size;
 	/* Clock required during LP commands */
-	char force_clk_lane_hs;
+	bool force_clk_lane_hs;
 
 	char vsync_enable;
 	char hw_vsync_mode;
@@ -346,6 +346,8 @@ struct mdss_mdp_pp_tear_check {
 	u32 rd_ptr_irq;
 	u32 refx100;
 };
+
+struct mdss_livedisplay_ctx;
 
 struct mdss_panel_info {
 	u32 xres;
@@ -417,6 +419,8 @@ struct mdss_panel_info {
 	struct mipi_panel_info mipi;
 	struct lvds_panel_info lvds;
 	struct edp_panel_info edp;
+
+	struct mdss_livedisplay_ctx *livedisplay;
 };
 
 struct mdss_panel_data {

@@ -53,7 +53,8 @@
 
 #include "mdss_fb.h"
 #include "mdss_mdp_splash_logo.h"
-#include "mdss_mdp.h"
+
+#include "mdss_livedisplay.h"
 
 #ifdef CONFIG_FB_MSM_TRIPLE_BUFFER
 #define MDSS_FB_NUM 3
@@ -655,68 +656,6 @@ static ssize_t mdss_fb_get_doze_mode(struct device *dev,
 	return scnprintf(buf, PAGE_SIZE, "%d\n", mfd->doze_mode);
 }
 
-static int pcc_r = 32768, pcc_g = 32768, pcc_b = 32768;
-static ssize_t mdss_get_rgb(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%d %d %d\n", pcc_r, pcc_g, pcc_b);
-}
-
-/**
- * simple color temperature interface using polynomial color correction
- *
- * input values are r/g/b adjustments from 0-32768 representing 0 -> 1
- *
- * example adjustment @ 3500K:
- * 1.0000 / 0.5515 / 0.2520 = 32768 / 25828 / 17347
- *
- * reference chart:
- * http://www.vendian.org/mncharity/dir3/blackbody/UnstableURLs/bbr_color.html
- */
-static ssize_t mdss_set_rgb(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	uint32_t r = 0, g = 0, b = 0;
-	struct mdp_pcc_cfg_data pcc_cfg;
-	u32 copyback = 0;
-
-    if (count > 19)
-		return -EINVAL;
-
-	sscanf(buf, "%d %d %d", &r, &g, &b);
-
-	if (r < 0 || r > 32768)
-		return -EINVAL;
-	if (g < 0 || g > 32768)
-		return -EINVAL;
-	if (b < 0 || b > 32768)
-		return -EINVAL;
-
-	pr_info("%s: r=%d g=%d b=%d", __func__, r, g, b);
-
-	memset(&pcc_cfg, 0, sizeof(struct mdp_pcc_cfg_data));
-
-	pcc_cfg.block = MDP_LOGICAL_BLOCK_DISP_0;
-	if (r == 32768 && g == 32768 && b == 32768)
-		pcc_cfg.ops = MDP_PP_OPS_DISABLE;
-	else
-		pcc_cfg.ops = MDP_PP_OPS_ENABLE;
-	pcc_cfg.ops |= MDP_PP_OPS_WRITE;
-	pcc_cfg.r.r = r;
-	pcc_cfg.g.g = g;
-	pcc_cfg.b.b = b;
-
-	if (mdss_mdp_pcc_config(&pcc_cfg, &copyback) == 0) {
-		pcc_r = r;
-		pcc_g = g;
-		pcc_b = b;
-		return count;
-	}
-
-	return -EINVAL;
-}
-
 static DEVICE_ATTR(msm_fb_type, S_IRUGO, mdss_fb_get_type, NULL);
 static DEVICE_ATTR(msm_fb_split, S_IRUGO | S_IWUSR, mdss_fb_show_split,
 					mdss_fb_store_split);
@@ -731,7 +670,6 @@ static DEVICE_ATTR(msm_fb_thermal_level, S_IRUGO | S_IWUSR,
 	mdss_fb_get_thermal_level, mdss_fb_set_thermal_level);
 static DEVICE_ATTR(always_on, S_IRUGO | S_IWUSR | S_IWGRP,
 	mdss_fb_get_doze_mode, mdss_fb_set_doze_mode);
-static DEVICE_ATTR(rgb, S_IRUGO | S_IWUSR | S_IWGRP, mdss_get_rgb, mdss_set_rgb);
 
 static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_type.attr,
@@ -743,7 +681,6 @@ static struct attribute *mdss_fb_attrs[] = {
 	&dev_attr_msm_fb_src_split_info.attr,
 	&dev_attr_msm_fb_thermal_level.attr,
 	&dev_attr_always_on.attr,
-	&dev_attr_rgb.attr,
 	NULL,
 };
 
@@ -758,7 +695,8 @@ static int mdss_fb_create_sysfs(struct msm_fb_data_type *mfd)
 	rc = sysfs_create_group(&mfd->fbi->dev->kobj, &mdss_fb_attr_group);
 	if (rc)
 		pr_err("sysfs group creation failed, rc=%d\n", rc);
-	return rc;
+
+	return mdss_livedisplay_create_sysfs(mfd);
 }
 
 static void mdss_fb_remove_sysfs(struct msm_fb_data_type *mfd)
@@ -784,6 +722,7 @@ static int mdss_fb_probe(struct platform_device *pdev)
 	struct fb_info *fbi;
 	const char *data;
 	int rc;
+	u32 cell_index = 0;
 
 	if (fbi_list_index >= MAX_FBI_LIST)
 		return -ENOMEM;
@@ -791,6 +730,11 @@ static int mdss_fb_probe(struct platform_device *pdev)
 	pdata = dev_get_platdata(&pdev->dev);
 	if (!pdata)
 		return -EPROBE_DEFER;
+
+	of_property_read_u32(pdev->dev.of_node, "cell-index", &cell_index);
+	if (cell_index > fbi_list_index)
+		return -EPROBE_DEFER;
+
 
 	/*
 	 * alloc framebuffer info + par data
@@ -835,6 +779,7 @@ static int mdss_fb_probe(struct platform_device *pdev)
 				mfd->fb_imgType = MDP_RGBA_8888;
 		}
 	}
+	mfd->calib_mode_bl = 0;
 
 	mfd->pdev = pdev;
 	mfd->split_mode = MDP_SPLIT_MODE_NONE;
@@ -1317,7 +1262,16 @@ static int mdss_fb_unblank_sub(struct msm_fb_data_type *mfd)
 		mutex_lock(&mfd->bl_lock);
 		if (!mfd->bl_updated) {
 			mfd->bl_updated = 1;
-			mdss_fb_set_backlight(mfd, mfd->unset_bl_level);
+			/*
+			 * If in AD calibration mode then frameworks would not
+			 * be allowed to update backlight hence post unblank
+			 * the backlight would remain 0 (0 is set in blank).
+			 * Hence resetting back to calibration mode value
+			 */
+			if (!IS_CALIB_MODE_BL(mfd))
+				mdss_fb_set_backlight(mfd, mfd->unset_bl_level);
+			else
+				mdss_fb_set_backlight(mfd, mfd->calib_mode_bl);
 		}
 		mutex_unlock(&mfd->bl_lock);
 	}
@@ -1400,16 +1354,16 @@ static int mdss_fb_blank_sub(int blank_mode, struct fb_info *info,
 			complete(&mfd->no_update.comp);
 
 			mfd->op_enable = false;
-			mutex_lock(&mfd->bl_lock);
 			if (mdss_panel_is_power_off(req_power_state)) {
 				/* Stop Display thread */
 				if (mfd->disp_thread)
 					mdss_fb_stop_disp_thread(mfd);
+				mutex_lock(&mfd->bl_lock);
 				mdss_fb_set_backlight(mfd, 0);
 				mfd->bl_updated = 0;
+				mutex_unlock(&mfd->bl_lock);
 			}
 			mfd->panel_power_state = req_power_state;
-			mutex_unlock(&mfd->bl_lock);
 
 			ret = mfd->mdp.off_fnc(mfd);
 			if (ret)
@@ -2237,7 +2191,7 @@ static int mdss_fb_release_all(struct fb_info *info, bool release_all)
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	struct mdss_fb_proc_info *pinfo = NULL, *temp_pinfo = NULL;
 	struct mdss_fb_proc_info *proc_info = NULL;
-	int ret = 0;
+	int ret = 0, ad_ret = 0;
 	int pid = current->tgid;
 	bool unknown_pid = true, release_needed = false;
 	struct task_struct *task = current->group_leader;
@@ -2265,7 +2219,7 @@ static int mdss_fb_release_all(struct fb_info *info, bool release_all)
 		unknown_pid = false;
 
 		pr_debug("found process %s pid=%d mfd->ref=%d pinfo->ref=%d\n",
-			task->comm, mfd->ref_cnt, pinfo->pid, pinfo->ref_cnt);
+			task->comm, pinfo->pid, mfd->ref_cnt, pinfo->ref_cnt);
 
 		proc_info = mdss_fb_release_file_entry(info, pinfo,
 								release_all);
@@ -2289,10 +2243,6 @@ static int mdss_fb_release_all(struct fb_info *info, bool release_all)
 			pinfo->ref_cnt--;
 			pm_runtime_put(info->dev);
 		} while (release_all && pinfo->ref_cnt);
-
-		/* we need to stop display thread before release */
-		if (release_all && mfd->disp_thread)
-			mdss_fb_stop_disp_thread(mfd);
 
 		if (pinfo->ref_cnt == 0) {
 			list_del(&pinfo->list);
@@ -2324,30 +2274,20 @@ static int mdss_fb_release_all(struct fb_info *info, bool release_all)
 		}
 	}
 
-	if (release_needed) {
-		pr_debug("current process=%s pid=%d known pid=%d mfd->ref=%d\n",
-			task->comm, current->tgid, pid, mfd->ref_cnt);
-
-		if (mfd->mdp.release_fnc) {
-			ret = mfd->mdp.release_fnc(mfd, false, pid);
-			if (ret)
-				pr_err("error releasing fb%d for current pid=%d known pid=%d\n",
-					mfd->index, current->tgid, pid);
-		}
-	} else if (release_all && mfd->ref_cnt) {
-		pr_err("reference count mismatch with proc list entries\n");
-	}
-
-	if (!mfd->ref_cnt) {
-		if (mfd->mdp.release_fnc) {
-			ret = mfd->mdp.release_fnc(mfd, true, pid);
-			if (ret)
-				pr_err("error fb%d release current process=%s pid=%d known pid=%d\n",
-				    mfd->index, task->comm, current->tgid, pid);
-		}
+	if (!mfd->ref_cnt || release_all) {
+		/* resources (if any) will be released during blank */
+		if (mfd->mdp.release_fnc)
+			mfd->mdp.release_fnc(mfd, true, pid);
 
 		if (mfd->fb_ion_handle)
 			mdss_fb_free_fb_ion_memory(mfd);
+
+		if (mfd->mdp.ad_shutdown_cleanup) {
+			ad_ret = (*mfd->mdp.ad_shutdown_cleanup)(mfd);
+			if (ad_ret)
+				pr_err("AD shutdown cleanup failed ret = %d\n",
+									ad_ret);
+		}
 
 		ret = mdss_fb_blank_sub(FB_BLANK_POWERDOWN, info,
 			mfd->op_enable);
@@ -2357,6 +2297,17 @@ static int mdss_fb_release_all(struct fb_info *info, bool release_all)
 			return ret;
 		}
 		atomic_set(&mfd->ioctl_ref_cnt, 0);
+	} else if (release_needed) {
+		pr_debug("current process=%s pid=%d known pid=%d mfd->ref=%d\n",
+			task->comm, current->tgid, pid, mfd->ref_cnt);
+
+		if (mfd->mdp.release_fnc) {
+			ret = mfd->mdp.release_fnc(mfd, false, pid);
+
+			/* display commit is needed to release resources */
+			if (ret)
+				mdss_fb_pan_display(&mfd->fbi->var, mfd->fbi);
+		}
 	}
 
 	return ret;
@@ -2908,26 +2859,16 @@ static int mdss_fb_check_var(struct fb_var_screeninfo *var,
 		return -EINVAL;
 
 	if (mfd->panel_info) {
-		struct mdss_panel_info *panel_info;
 		int rc;
-		panel_info = kzalloc(sizeof(struct mdss_panel_info),
-				GFP_KERNEL);
-		if (!panel_info) {
-			pr_err("panel info is NULL\n");
-			return -ENOMEM;
-		}
 
-		memcpy(panel_info, mfd->panel_info,
-				sizeof(struct mdss_panel_info));
-		mdss_fb_var_to_panelinfo(var, panel_info);
+		memcpy(&mfd->reconfig_panel_info, mfd->panel_info,
+				sizeof(mfd->reconfig_panel_info));
+		mdss_fb_var_to_panelinfo(var, &mfd->reconfig_panel_info);
 		rc = mdss_fb_send_panel_event(mfd, MDSS_EVENT_CHECK_PARAMS,
-			panel_info);
-		if (IS_ERR_VALUE(rc)) {
-			kfree(panel_info);
+			&mfd->reconfig_panel_info);
+		if (IS_ERR_VALUE(rc))
 			return rc;
-		}
 		mfd->panel_reconfig = rc;
-		kfree(panel_info);
 	}
 
 	return 0;

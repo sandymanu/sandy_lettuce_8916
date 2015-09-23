@@ -624,6 +624,15 @@ static inline int mdss_mdp_line_buffer_width(void)
 	return MAX_LINE_BUFFER_WIDTH;
 }
 
+static inline bool mdss_mdp_req_init_restore_cfg(struct mdss_data_type *mdata)
+{
+	if ((mdata->mdp_rev == MDSS_MDP_HW_REV_106) ||
+                (mdata->mdp_rev == MDSS_MDP_HW_REV_108))
+		return true;
+
+	return false;
+}
+
 static inline int mdss_mdp_panic_signal_support_mode(
 	struct mdss_data_type *mdata, struct mdss_mdp_pipe *pipe)
 {
@@ -953,4 +962,6 @@ int mdss_mdp_wb_set_secure(struct msm_fb_data_type *mfd, int enable);
 int mdss_mdp_wb_get_secure(struct msm_fb_data_type *mfd, uint8_t *enable);
 void mdss_mdp_ctl_restore(void);
 int  mdss_mdp_ctl_reset(struct mdss_mdp_ctl *ctl);
+int mdss_mdp_user_pcc_config(struct mdp_pcc_cfg_data *config);
+
 #endif /* MDSS_MDP_H */

@@ -23,6 +23,7 @@
 #include <linux/err.h>
 
 #include "mdss_dsi.h"
+#include "mdss_livedisplay.h"
 
 #define DT_CMD_HDR 6
 
@@ -151,11 +152,7 @@ u32 mdss_dsi_panel_cmd_read(struct mdss_dsi_ctrl_pdata *ctrl, char cmd0,
 	return 0;
 }
 
-#ifdef CONFIG_YULONG_COLOR
 void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
-#else
-static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
-#endif
 			struct dsi_panel_cmds *pcmds)
 {
 	struct dcs_cmd_req cmdreq;
@@ -175,6 +172,8 @@ static void mdss_dsi_panel_cmds_send(struct mdss_dsi_ctrl_pdata *ctrl,
 	/*Panel ON/Off commands should be sent in DSI Low Power Mode*/
 	if (pcmds->link_state == DSI_LP_MODE)
 		cmdreq.flags  |= CMD_REQ_LP_MODE;
+	else if (pcmds->link_state == DSI_HS_MODE)
+		cmdreq.flags |= CMD_REQ_HS_MODE;
 
 	cmdreq.rlen = 0;
 	cmdreq.cb = NULL;
@@ -644,9 +643,6 @@ static void mdss_dsi_panel_bl_ctrl(struct mdss_panel_data *pdata,
 	}
 }
 
-#ifdef CONFIG_YULONG_COLOR
-extern void color_enhancement_impl_apply(void);
-#endif
 static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 {
 	struct mdss_dsi_ctrl_pdata *ctrl = NULL;
@@ -676,9 +672,7 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 	if (ctrl->on_cmds.cmd_cnt)
 		mdss_dsi_panel_cmds_send(ctrl, &ctrl->on_cmds);
 
-#ifdef CONFIG_YULONG_COLOR
-	color_enhancement_impl_apply();
-#endif
+	mdss_livedisplay_update(ctrl, MODE_UPDATE_ALL);
 
 end:
 	pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
@@ -904,7 +898,7 @@ static void mdss_dsi_parse_trigger(struct device_node *np, char *trigger,
 }
 
 
-static int mdss_dsi_parse_dcs_cmds(struct device_node *np,
+int mdss_dsi_parse_dcs_cmds(struct device_node *np,
 		struct dsi_panel_cmds *pcmds, char *cmd_key, char *link_key)
 {
 	const char *data;
@@ -1506,6 +1500,12 @@ static void mdss_dsi_parse_dfps_config(struct device_node *pan_node,
 	return;
 }
 
+void mdss_dsi_unregister_bl_settings(struct mdss_dsi_ctrl_pdata *ctrl_pdata)
+{
+	if (ctrl_pdata->bklt_ctrl == BL_WLED)
+		led_trigger_unregister_simple(bl_led_trigger);
+}
+
 static int mdss_panel_parse_dt(struct device_node *np,
 			struct mdss_dsi_ctrl_pdata *ctrl_pdata)
 {
@@ -1892,6 +1892,8 @@ static int mdss_panel_parse_dt(struct device_node *np,
 		}
 #endif
 	}
+	pinfo->mipi.force_clk_lane_hs = of_property_read_bool(np,
+		"qcom,mdss-dsi-force-clock-lane-hs");
 
 	rc = mdss_dsi_parse_panel_features(np, ctrl_pdata);
 	if (rc) {
@@ -1903,15 +1905,14 @@ static int mdss_panel_parse_dt(struct device_node *np,
 
 	mdss_dsi_parse_dfps_config(np, ctrl_pdata);
 
+	mdss_livedisplay_parse_dt(np, pinfo);
+
 	return 0;
 
 error:
 	return -EINVAL;
 }
 
-#ifdef CONFIG_YULONG_COLOR
-extern void color_enhancement_impl_init(struct mdss_dsi_ctrl_pdata *);
-#endif
 int mdss_dsi_panel_init(struct device_node *node,
 	struct mdss_dsi_ctrl_pdata *ctrl_pdata,
 	bool cmd_cfg_cont_splash)
@@ -1957,10 +1958,6 @@ int mdss_dsi_panel_init(struct device_node *node,
 	ctrl_pdata->low_power_config = mdss_dsi_panel_low_power_config;
 	ctrl_pdata->panel_data.set_backlight = mdss_dsi_panel_bl_ctrl;
 	ctrl_pdata->switch_mode = mdss_dsi_panel_switch_mode;
-
-#ifdef CONFIG_YULONG_COLOR
-	color_enhancement_impl_init(ctrl_pdata);
-#endif
 
 	return 0;
 }
